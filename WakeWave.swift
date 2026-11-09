@@ -399,30 +399,36 @@ func stageUpdate(dmg: URL, version: String, bundleID: String) throws -> URL {
     return app
 }
 
+enum UpdateState: Equatable {
+    case idle, checking, downloading, latest
+    case available(String)                        // newer version found while auto-install is off
+    case failed(String)                           // what went wrong (shown as a tooltip)
+}
+
 final class Updater {
     let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-    private(set) var status: String?
-    private(set) var available: String?           // newer version found while auto-install is off
-    private(set) var busy = false
+    private(set) var state = UpdateState.idle
     var onChange: (() -> Void)?
     var resumeArgument: () -> String = { "on" }   // the on/off state handed to the relaunched app
 
     // Release builds only: a local "dev" build never replaces itself.
     var isEnabled: Bool { version?.first?.isNumber == true }
+    var busy: Bool { state == .checking || state == .downloading }
+    var availableVersion: String? { if case .available(let v) = state { return v } else { return nil } }
 
     func check(manual: Bool = false, minInterval: TimeInterval = 0) {
         guard isEnabled, let version = version, !busy else { return }
         if !manual, Date().timeIntervalSince1970 - defaults.double(forKey: Pref.lastUpdateCheck) < minInterval { return }
         if Bundle.main.bundlePath.contains("/AppTranslocation/") {
-            if manual { finish("Move WakeWave to your Applications folder to get updates.") }
+            if manual { set(.failed("Move WakeWave to your Applications folder to get updates.")) }
             return
         }
-        busy = true
-        if manual { set("Checking for updates…") }
+        let previous = state
+        set(.checking)
         var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(updateRepo)/releases/latest")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("WakeWave/\(version)", forHTTPHeaderField: "User-Agent")
-        fetch(request) { self.found($0, current: version, manual: manual) }
+        fetch(request) { self.found($0, current: version, manual: manual, previous: previous) }
     }
 
     private func fetch(_ request: URLRequest, _ done: @escaping (Data?) -> Void) {
@@ -432,29 +438,23 @@ final class Updater {
         }.resume()
     }
 
-    private func found(_ data: Data?, current: String, manual: Bool) {
+    private func found(_ data: Data?, current: String, manual: Bool, previous: UpdateState) {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         guard let data = data, let release = try? decoder.decode(Release.self, from: data) else {
-            return finish(manual ? "Couldn't reach GitHub. Try again later." : nil)
+            return set(manual ? .failed("Couldn't reach GitHub. Try again later.") : previous)  // quiet when automatic
         }
         defaults.set(Date().timeIntervalSince1970, forKey: Pref.lastUpdateCheck)
         let latest = release.tagName.hasPrefix("v") ? String(release.tagName.dropFirst()) : release.tagName
-        guard isNewer(latest, than: current) else {
-            available = nil
-            return finish(manual ? "WakeWave \(current) is the latest version." : nil)
-        }
-        guard manual || defaults.bool(forKey: Pref.autoUpdate) else {
-            available = latest
-            return finish("WakeWave \(latest) is available.")
-        }
+        guard isNewer(latest, than: current) else { return set(.latest) }
+        guard manual || defaults.bool(forKey: Pref.autoUpdate) else { return set(.available(latest)) }
         let prefix = "https://github.com/\(updateRepo)/releases/download/"
         guard let dmg = release.assets.first(where: { $0.name == "WakeWave.dmg" })?.browserDownloadUrl,
               let sig = release.assets.first(where: { $0.name == "WakeWave.dmg.sig" })?.browserDownloadUrl,
               dmg.absoluteString.hasPrefix(prefix), sig.absoluteString.hasPrefix(prefix) else {
-            return finish("WakeWave \(latest) has no signed download.")
+            return set(.failed("WakeWave \(latest) has no signed download."))
         }
-        set("Downloading WakeWave \(latest)…")
+        set(.downloading)
         fetch(URLRequest(url: sig)) { sigData in
             self.fetch(URLRequest(url: dmg)) { dmgData in self.install(latest, dmgData, sigData) }
         }
@@ -464,7 +464,7 @@ final class Updater {
         guard let file = dmgData, let text = sigData.map({ String(decoding: $0, as: UTF8.self) }),
               let signature = Data(base64Encoded: text.trimmingCharacters(in: .whitespacesAndNewlines)),
               signatureIsValid(signature, for: file) else {
-            return finish("The WakeWave \(version) download failed verification and was discarded.")
+            return set(.failed("The WakeWave \(version) download failed verification and was discarded."))
         }
         let bundleID = Bundle.main.bundleIdentifier ?? ""
         DispatchQueue.global(qos: .utility).async {
@@ -476,7 +476,7 @@ final class Updater {
             DispatchQueue.main.async {
                 switch staged {
                 case .success(let app): self.replaceAndRelaunch(with: app, dmg: dmg, version: version)
-                case .failure(let error): self.finish("Couldn't install WakeWave \(version): \(error)")
+                case .failure(let error): self.set(.failed("Couldn't install WakeWave \(version): \(error)"))
                 }
             }
         }
@@ -488,8 +488,8 @@ final class Updater {
             _ = try FileManager.default.replaceItemAt(target, withItemAt: app)
         } catch {
             NSWorkspace.shared.open(dmg)              // fall back to a manual drag-install
-            return finish("Couldn't replace the app (\(error.localizedDescription)). "
-                          + "WakeWave \(version) is open in Finder: drag it to Applications.")
+            return set(.failed("Couldn't replace the app (\(error.localizedDescription)). "
+                               + "WakeWave \(version) is open in Finder: drag it to Applications."))
         }
         try? FileManager.default.removeItem(at: dmg)
         let config = NSWorkspace.OpenConfiguration()
@@ -498,7 +498,7 @@ final class Updater {
         NSWorkspace.shared.openApplication(at: target, configuration: config) { _, error in
             DispatchQueue.main.async {
                 if let error = error {
-                    self.finish("Updated to \(version). Quit and reopen WakeWave (\(error.localizedDescription)).")
+                    self.set(.failed("Updated to \(version). Quit and reopen WakeWave (\(error.localizedDescription))."))
                 } else {
                     NSApp.terminate(nil)
                 }
@@ -506,8 +506,7 @@ final class Updater {
         }
     }
 
-    private func set(_ text: String) { status = text; onChange?() }
-    private func finish(_ text: String?) { busy = false; if let t = text { status = t }; onChange?() }
+    private func set(_ new: UpdateState) { state = new; onChange?() }
 }
 
 // MARK: - Menu bar UI
@@ -713,7 +712,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(speakerItem)
 
         menu.addItem(.separator())
-        if let v = updater.available {
+        if let v = updater.availableVersion {
             let update = NSMenuItem(title: "Install WakeWave \(v)", action: #selector(installUpdate), keyEquivalent: "")
             update.target = self
             menu.addItem(update)
@@ -774,7 +773,7 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
     private let login = NSButton(checkboxWithTitle: "Launch WakeWave at login", target: nil, action: nil)
     private let autoUpdate = NSButton(checkboxWithTitle: "Install updates automatically", target: nil, action: nil)
     private let checkNow = NSButton(title: "Check Now", target: nil, action: nil)
-    private let updateStatus = NSTextField(wrappingLabelWithString: "")
+    private let updateStatus = NSTextField(labelWithString: "")   // one word, so it never clips
 
     init(app: AppDelegate) {
         self.app = app
@@ -804,8 +803,7 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         login.target = self; login.action = #selector(loginChanged)
         autoUpdate.target = self; autoUpdate.action = #selector(autoUpdateChanged)
         checkNow.target = self; checkNow.action = #selector(checkForUpdates)
-        updateStatus.preferredMaxLayoutWidth = 230
-        updateStatus.textColor = .secondaryLabelColor
+        updateStatus.widthAnchor.constraint(equalToConstant: 80).isActive = true
         let restore = NSButton(title: "Restore Defaults", target: self, action: #selector(restoreDefaults))
 
         func label(_ text: String) -> NSTextField { NSTextField(labelWithString: text) }
@@ -874,7 +872,20 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         let u = app.updater
         autoUpdate.isEnabled = u.isEnabled
         checkNow.isEnabled = u.isEnabled && !u.busy
-        updateStatus.stringValue = u.isEnabled ? (u.status ?? "") : "Updates are off in development builds."
+        let (word, tint, detail): (String, NSColor, String?) = {
+            guard u.isEnabled else { return ("Dev build", .secondaryLabelColor, "Updates are off in development builds.") }
+            switch u.state {
+            case .idle: return ("", .secondaryLabelColor, nil)
+            case .checking: return ("Checking…", .secondaryLabelColor, nil)
+            case .downloading: return ("Updating…", .secondaryLabelColor, nil)
+            case .latest: return ("Latest!", .systemGreen, "WakeWave \(u.version ?? "") is the latest version.")
+            case .available(let v): return ("Update", .systemOrange, "WakeWave \(v) is available. Click Check Now to install it.")
+            case .failed(let why): return ("Failed", .systemRed, why)
+            }
+        }()
+        updateStatus.stringValue = word
+        updateStatus.textColor = tint
+        updateStatus.toolTip = detail
     }
 
     @objc private func iconChanged() {
