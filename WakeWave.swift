@@ -1,22 +1,78 @@
-// WakeWave: a menu bar app that keeps an AUX or Bluetooth speaker awake by playing an
-// inaudible 20 Hz tone (-30 dBFS) straight to an output device through a Core Audio IOProc.
-// Automatic mode follows macOS's default output device; a specific device can be picked instead.
+// WakeWave: a menu bar app that keeps speakers awake by playing an inaudible 20 Hz tone straight to
+// an output device through a Core Audio IOProc. Automatic mode follows macOS's default output device;
+// a specific device can be picked instead.
 // No polling: it reacts only to Core Audio property listeners, the system wake notification, and a
-// single one-shot timer at the end of a chosen duration.
-// CLI flags for testing: --selftest (tone math, no hardware), --list (output devices), --probe N.
+// single one-shot timer at the end of a chosen duration. Update checks run at launch, after wake and
+// on request.
+// CLI flags for testing: --selftest (tone and update math, no hardware), --list (output devices),
+// --probe N (play to the default output for N seconds).
 import Cocoa
 import CoreAudio
+import CryptoKit
+import ServiceManagement
 
 let toneFrequency = 20.0
-let toneAmplitude: Float = 0.031622777            // -30 dBFS = 10^(-30/20); --selftest checks it
+// Signal strength choices. Amplitudes are 10^(dBFS/20), precomputed; --selftest checks them.
+let signalLevels: [(dBFS: Int, title: String, amplitude: Float)] = [
+    (-30, "Normal", 0.031622777), (-24, "Strong", 0.063095734), (-18, "Max", 0.12589254),
+]
 let wantedBufferFrames: UInt32 = 4096             // bigger IO buffer = fewer wakeups (~12/s at 48 kHz)
 let durationChoices: [(minutes: Int?, title: String)] = [
     (nil, "Indefinitely"), (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour"),
     (120, "2 hours"), (240, "4 hours"), (480, "8 hours"),
 ]
-let prefDeviceUID = "deviceUID", prefDeviceName = "deviceName"
-let keepAliveGreen = NSColor(srgbRed: 61 / 255.0, green: 225 / 255.0, blue: 85 / 255.0, alpha: 1)  // #3DE155
+// Menu bar icon choices (SF Symbols available since macOS 11).
+let iconChoices: [(symbol: String, title: String)] = [
+    ("hifispeaker.fill", "Speaker"), ("hifispeaker", "Speaker Outline"), ("hifispeaker.2.fill", "Two Speakers"),
+    ("speaker.wave.2.fill", "Speaker with Sound"), ("speaker.fill", "Small Speaker"),
+    ("speaker.slash.fill", "Muted Speaker"), ("waveform", "Waveform"),
+    ("dot.radiowaves.left.and.right", "Radio Waves"), ("music.note", "Music Note"), ("power", "Power"),
+]
+let defaultActiveColor = "#3DE155"
+let updateRepo = "janmejayspurohit/WakeWave"
+// Ed25519 public keys trusted for updates. Release DMGs are signed in CI with the private half of one
+// of them (a GitHub secret). Rotating takes two releases: list old + new and sign with the old key,
+// then switch the secret to the new key and drop the old one.
+let updatePublicKeys = [
+    "CgBQx/2IjgDTGqM292rr0uwABxa63t+Keh8HRc2xfXA=", "G5IdIih+7MXvM0FMbl5cCvsnQcW51mBRyfWttxqvuds=",
+    "1X1hhMd8uiS1OZ8a8eCPusnVCsOjNZworz0KlfkP6CQ=", "qk54CQA1Pjp0s7yCjhJCwbQ1U72JqYq3t0LQKEcDGOA=",
+    "j83ZefHSZW+TF/zM3w2FsfGdTAaQrxWZH7ZcvGCZE60=",
+]
 let systemObject = AudioObjectID(kAudioObjectSystemObject)
+
+enum Pref {
+    static let deviceUID = "deviceUID", deviceName = "deviceName"
+    static let activeSymbol = "activeSymbol", inactiveSymbol = "inactiveSymbol"
+    static let activeColor = "activeColor", inactiveColor = "inactiveColor"   // "#RRGGBB"
+    static let signalLevel = "signalLevel"                                     // dBFS
+    static let autoUpdate = "autoUpdate", lastUpdateCheck = "lastUpdateCheck"
+}
+
+let defaults: UserDefaults = {
+    let d = UserDefaults.standard
+    d.register(defaults: [Pref.activeSymbol: "hifispeaker.fill", Pref.inactiveSymbol: "hifispeaker.fill",
+                          Pref.activeColor: defaultActiveColor, Pref.signalLevel: -30, Pref.autoUpdate: true])
+    return d
+}()
+
+func hexString(_ color: NSColor) -> String {
+    let c = color.usingColorSpace(.sRGB) ?? .white
+    return String(format: "#%02X%02X%02X", Int((c.redComponent * 255).rounded()),
+                  Int((c.greenComponent * 255).rounded()), Int((c.blueComponent * 255).rounded()))
+}
+
+func color(fromHex hex: String?) -> NSColor? {
+    guard let hex = hex, hex.count == 7, hex.hasPrefix("#"), let v = Int(hex.dropFirst(), radix: 16) else { return nil }
+    return NSColor(srgbRed: CGFloat(v >> 16 & 0xFF) / 255, green: CGFloat(v >> 8 & 0xFF) / 255,
+                   blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+}
+
+let keepAliveGreen = color(fromHex: defaultActiveColor)!
+
+func currentAmplitude() -> Float {
+    let dBFS = defaults.integer(forKey: Pref.signalLevel)
+    return (signalLevels.first { $0.dBFS == dBFS } ?? signalLevels[0]).amplitude
+}
 
 // MARK: - Tone
 
@@ -25,9 +81,9 @@ struct ToneGenerator {
     let table: [Float]
     var index = 0
 
-    init(sampleRate: Double) {
+    init(sampleRate: Double, amplitude: Float) {
         let n = max(Int((sampleRate / toneFrequency).rounded()), 4)   // 2400 samples at 48 kHz
-        table = (0..<n).map { toneAmplitude * Float(sin(2 * Double.pi * Double($0) / Double(n))) }
+        table = (0..<n).map { amplitude * Float(sin(2 * Double.pi * Double($0) / Double(n))) }
     }
 
     // Interleaved Float32, the same sample on every channel; the position carries across calls.
@@ -51,7 +107,7 @@ struct ToneGenerator {
 final class Renderer {
     var generator: ToneGenerator
     var callbacks = 0, frames = 0, lastBufferFrames = 0
-    init(sampleRate: Double) { generator = ToneGenerator(sampleRate: sampleRate) }
+    init(sampleRate: Double, amplitude: Float) { generator = ToneGenerator(sampleRate: sampleRate, amplitude: amplitude) }
 
     func render(_ abl: UnsafeMutableAudioBufferListPointer) {
         guard abl.count > 0, let d0 = abl[0].mData else { return }
@@ -203,13 +259,14 @@ final class Engine {
         }
     }
 
-    func turnOn(minutes: Int?) {
+    // `end` is given only when resuming a timed session after an update relaunch.
+    func turnOn(minutes: Int?, until end: Date? = nil) {
         resetToOff()
         enabled = true; activeMinutes = minutes
         if let m = minutes {
-            let seconds = TimeInterval(m * 60)
-            until = Date(timeIntervalSinceNow: seconds)
-            let t = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in self?.turnOff() }
+            let deadline = end ?? Date(timeIntervalSinceNow: TimeInterval(m * 60))
+            until = deadline
+            let t = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in self?.turnOff() }
             RunLoop.main.add(t, forMode: .common)     // .common so it also fires while a menu is open
             expiry = t
         }
@@ -225,8 +282,8 @@ final class Engine {
 
     func select(uid: String?, name: String?) {
         selectedUID = uid; selectedName = name
-        UserDefaults.standard.set(uid, forKey: prefDeviceUID)    // nil removes the key = Automatic
-        UserDefaults.standard.set(name, forKey: prefDeviceName)
+        defaults.set(uid, forKey: Pref.deviceUID)     // nil removes the key = Automatic
+        defaults.set(name, forKey: Pref.deviceName)
         restart()
     }
 
@@ -248,7 +305,7 @@ final class Engine {
         let name = stringProperty(id, kAudioObjectPropertyName) ?? "Output device"
         guard outputIsFloat32(id) else { lastError = "\(name): not a 32-bit float output, skipped"; return }
         setBufferFrames(id, wantedBufferFrames)
-        let r = Renderer(sampleRate: nominalSampleRate(id))
+        let r = Renderer(sampleRate: nominalSampleRate(id), amplitude: currentAmplitude())
         var pid: AudioDeviceIOProcID?
         guard AudioDeviceCreateIOProcIDWithBlock(&pid, id, nil, { _, _, _, out, _ in
             r.render(UnsafeMutableAudioBufferListPointer(out))
@@ -280,6 +337,177 @@ final class Engine {
         }
         current = nil; currentName = nil; procID = nil
     }
+}
+
+// MARK: - Updates
+
+// Checks the latest GitHub release at launch, after wake (at most every 12 hours) and on request.
+// A newer WakeWave.dmg is installed only if its Ed25519 signature matches one of updatePublicKeys.
+struct Release: Decodable {
+    struct Asset: Decodable { let name: String; let browserDownloadUrl: URL }
+    let tagName: String
+    let assets: [Asset]
+}
+
+struct UpdateError: Error, CustomStringConvertible {
+    let description: String
+    init(_ description: String) { self.description = description }
+}
+
+func isNewer(_ a: String, than b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) {
+        let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+        if p != q { return p > q }
+    }
+    return false
+}
+
+func signatureIsValid(_ signature: Data, for file: Data, publicKeys: [String] = updatePublicKeys) -> Bool {
+    publicKeys.contains { encoded in
+        guard let raw = Data(base64Encoded: encoded),
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
+        return key.isValidSignature(signature, for: file)
+    }
+}
+
+func runTool(_ path: String, _ arguments: String...) throws {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = arguments
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try p.run()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else {
+        throw UpdateError("\((path as NSString).lastPathComponent) exited with \(p.terminationStatus)")
+    }
+}
+
+// Mounts the DMG read-only, copies WakeWave.app out of it, and checks it is the expected app and version.
+func stageUpdate(dmg: URL, version: String, bundleID: String) throws -> URL {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("WakeWave-update-\(UUID().uuidString)")
+    let mount = dir.appendingPathComponent("mount"), app = dir.appendingPathComponent("WakeWave.app")
+    try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
+    try runTool("/usr/bin/hdiutil", "attach", "-nobrowse", "-noautoopen", "-readonly", "-mountpoint", mount.path, dmg.path)
+    defer { try? runTool("/usr/bin/hdiutil", "detach", "-force", mount.path) }
+    try runTool("/usr/bin/ditto", mount.appendingPathComponent("WakeWave.app").path, app.path)
+    guard let b = Bundle(url: app), b.bundleIdentifier == bundleID,
+          b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == version else {
+        throw UpdateError("the downloaded app is not WakeWave \(version)")
+    }
+    return app
+}
+
+final class Updater {
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    private(set) var status: String?
+    private(set) var available: String?           // newer version found while auto-install is off
+    private(set) var busy = false
+    var onChange: (() -> Void)?
+    var resumeArgument: () -> String = { "on" }   // the on/off state handed to the relaunched app
+
+    // Release builds only: a local "dev" build never replaces itself.
+    var isEnabled: Bool { version?.first?.isNumber == true }
+
+    func check(manual: Bool = false, minInterval: TimeInterval = 0) {
+        guard isEnabled, let version = version, !busy else { return }
+        if !manual, Date().timeIntervalSince1970 - defaults.double(forKey: Pref.lastUpdateCheck) < minInterval { return }
+        if Bundle.main.bundlePath.contains("/AppTranslocation/") {
+            if manual { finish("Move WakeWave to your Applications folder to get updates.") }
+            return
+        }
+        busy = true
+        if manual { set("Checking for updates…") }
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(updateRepo)/releases/latest")!)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("WakeWave/\(version)", forHTTPHeaderField: "User-Agent")
+        fetch(request) { self.found($0, current: version, manual: manual) }
+    }
+
+    private func fetch(_ request: URLRequest, _ done: @escaping (Data?) -> Void) {
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            DispatchQueue.main.async { done(ok ? data : nil) }
+        }.resume()
+    }
+
+    private func found(_ data: Data?, current: String, manual: Bool) {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let data = data, let release = try? decoder.decode(Release.self, from: data) else {
+            return finish(manual ? "Couldn't reach GitHub. Try again later." : nil)
+        }
+        defaults.set(Date().timeIntervalSince1970, forKey: Pref.lastUpdateCheck)
+        let latest = release.tagName.hasPrefix("v") ? String(release.tagName.dropFirst()) : release.tagName
+        guard isNewer(latest, than: current) else {
+            available = nil
+            return finish(manual ? "WakeWave \(current) is the latest version." : nil)
+        }
+        guard manual || defaults.bool(forKey: Pref.autoUpdate) else {
+            available = latest
+            return finish("WakeWave \(latest) is available.")
+        }
+        let prefix = "https://github.com/\(updateRepo)/releases/download/"
+        guard let dmg = release.assets.first(where: { $0.name == "WakeWave.dmg" })?.browserDownloadUrl,
+              let sig = release.assets.first(where: { $0.name == "WakeWave.dmg.sig" })?.browserDownloadUrl,
+              dmg.absoluteString.hasPrefix(prefix), sig.absoluteString.hasPrefix(prefix) else {
+            return finish("WakeWave \(latest) has no signed download.")
+        }
+        set("Downloading WakeWave \(latest)…")
+        fetch(URLRequest(url: sig)) { sigData in
+            self.fetch(URLRequest(url: dmg)) { dmgData in self.install(latest, dmgData, sigData) }
+        }
+    }
+
+    private func install(_ version: String, _ dmgData: Data?, _ sigData: Data?) {
+        guard let file = dmgData, let text = sigData.map({ String(decoding: $0, as: UTF8.self) }),
+              let signature = Data(base64Encoded: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              signatureIsValid(signature, for: file) else {
+            return finish("The WakeWave \(version) download failed verification and was discarded.")
+        }
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+        DispatchQueue.global(qos: .utility).async {
+            let dmg = FileManager.default.temporaryDirectory.appendingPathComponent("WakeWave-\(version).dmg")
+            let staged = Result { () throws -> URL in
+                try file.write(to: dmg)
+                return try stageUpdate(dmg: dmg, version: version, bundleID: bundleID)
+            }
+            DispatchQueue.main.async {
+                switch staged {
+                case .success(let app): self.replaceAndRelaunch(with: app, dmg: dmg, version: version)
+                case .failure(let error): self.finish("Couldn't install WakeWave \(version): \(error)")
+                }
+            }
+        }
+    }
+
+    private func replaceAndRelaunch(with app: URL, dmg: URL, version: String) {
+        let target = Bundle.main.bundleURL
+        do {
+            _ = try FileManager.default.replaceItemAt(target, withItemAt: app)
+        } catch {
+            NSWorkspace.shared.open(dmg)              // fall back to a manual drag-install
+            return finish("Couldn't replace the app (\(error.localizedDescription)). "
+                          + "WakeWave \(version) is open in Finder: drag it to Applications.")
+        }
+        try? FileManager.default.removeItem(at: dmg)
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        config.arguments = ["--resume", resumeArgument()]
+        NSWorkspace.shared.openApplication(at: target, configuration: config) { _, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    self.finish("Updated to \(version). Quit and reopen WakeWave (\(error.localizedDescription)).")
+                } else {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    private func set(_ text: String) { status = text; onChange?() }
+    private func finish(_ text: String?) { busy = false; if let t = text { status = t }; onChange?() }
 }
 
 // MARK: - Menu bar UI
@@ -339,11 +567,13 @@ final class PassThroughImageView: NSImageView {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let engine = Engine(selectedUID: UserDefaults.standard.string(forKey: prefDeviceUID),
-                        selectedName: UserDefaults.standard.string(forKey: prefDeviceName))
+    let engine = Engine(selectedUID: defaults.string(forKey: Pref.deviceUID),
+                        selectedName: defaults.string(forKey: Pref.deviceName))
+    let updater = Updater()
     var item: NSStatusItem!
     let menu = NSMenu()
     var menuIsOpen = false                         // rebuild items only while someone is looking
+    var settings: SettingsWindow?                  // created the first time Settings is opened
     let headerIcon = NSImageView(frame: NSRect(x: 14, y: 8, width: 18, height: 18))
     let barIcon = PassThroughImageView()
     let headerSwitch = MenuSwitch(frame: NSRect(x: 280 - 14 - 48, y: 6, width: 48, height: 22))
@@ -355,29 +585,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         engine.onChange = { [weak self] in self?.refresh() }
-        engine.turnOn(minutes: nil)                    // opening the app means "keep it awake"
+        updater.onChange = { [weak self] in
+            if self?.menuIsOpen == true { self?.rebuildMenu() }
+            self?.settings?.sync()
+        }
+        updater.resumeArgument = { [weak self] in self?.resumeArgument() ?? "on" }
+        resume(from: CommandLine.arguments)
+        updater.check()
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in
+            self?.updater.check(minInterval: 12 * 3600)
+        }
+    }
+
+    // WakeWave starts on, unless an update relaunched it: then it continues the previous state,
+    // passed as "--resume off", "--resume on" or "--resume <minutes>@<end time>".
+    func resume(from args: [String]) {
+        let state = args.count > 2 && args[1] == "--resume" ? args[2] : "on"
+        let parts = state.split(separator: "@")
+        if state == "off" {
+            engine.turnOff()
+        } else if parts.count == 2, let m = Int(parts[0]), let end = Double(parts[1]) {
+            engine.turnOn(minutes: m, until: Date(timeIntervalSince1970: end))
+        } else {
+            engine.turnOn(minutes: nil)
+        }
+    }
+
+    func resumeArgument() -> String {
+        guard engine.enabled else { return "off" }
+        guard let m = engine.activeMinutes, let end = engine.until else { return "on" }
+        return "\(m)@\(Int(end.timeIntervalSince1970))"
     }
 
     func menuWillOpen(_ menu: NSMenu) { menuIsOpen = true; rebuildMenu() }   // fresh device list
     func menuDidClose(_ menu: NSMenu) { menuIsOpen = false }
 
-    // The menu bar icon is an image view tinting the solid template symbol, which renders sharper
-    // than the button's own image. 14 pt is a whole size, so edges stay on pixels on 1x displays, and
-    // the frame is set by hand to whole pixels: centered with floor(), never a half-pixel offset.
+    // The menu bar icon is an image view tinting a template symbol, which renders sharper than the
+    // button's own image. 14 pt is a whole size, so edges stay on pixels on 1x displays, and the
+    // frame is set by hand to whole pixels: centered with floor(), never a half-pixel offset.
     func setUpStatusItem() {
-        let symbol = NSImage(systemSymbolName: "hifispeaker.fill", accessibilityDescription: nil)!
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))!
-        item = NSStatusBar.system.statusItem(withLength: symbol.size.width + 4)   // 2 pt each side
+        item = NSStatusBar.system.statusItem(withLength: 20)
         guard let button = item.button else { return }
         button.toolTip = "WakeWave"
         button.setAccessibilityLabel("WakeWave")
-        barIcon.image = symbol
         barIcon.onAppearanceChange = { [weak self] in self?.refresh() }
         button.addSubview(barIcon)
-        button.postsFrameChangedNotifications = true    // re-center if the menu bar height changes
+        button.postsFrameChangedNotifications = true    // re-center when the item or menu bar resizes
         NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: button,
                                                queue: .main) { [weak self] _ in self?.centerBarIcon() }
-        centerBarIcon()
     }
 
     func centerBarIcon() {
@@ -386,12 +642,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                y: floor((button.bounds.height - s.height) / 2), width: s.width, height: s.height)
     }
 
-    // Green while on; solid white while off (solid black on a light menu bar). Solid colors, not
-    // labelColor, which in the menu bar is 90% white blended with the wallpaper.
+    func barSymbol(on: Bool) -> NSImage {
+        let name = defaults.string(forKey: on ? Pref.activeSymbol : Pref.inactiveSymbol) ?? ""
+        let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+            ?? NSImage(systemSymbolName: "hifispeaker.fill", accessibilityDescription: nil)!
+        return symbol.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))!
+    }
+
+    // Icon and color come from Settings. With no inactive color chosen, the off icon is solid white
+    // (solid black on a light menu bar). Solid colors, not labelColor, which in the menu bar is 90%
+    // white blended with the wallpaper.
     func refresh() {
+        let on = engine.enabled
+        let shown = barSymbol(on: on), other = barSymbol(on: !on)
+        barIcon.image = shown
+        item.length = max(shown.size.width, other.size.width) + 4   // 2 pt each side, same width on and off
         let dark = [.darkAqua, .vibrantDark].contains(
             barIcon.effectiveAppearance.bestMatch(from: [.darkAqua, .vibrantDark, .aqua, .vibrantLight]))
-        barIcon.contentTintColor = engine.enabled ? keepAliveGreen : (dark ? .white : .black)
+        barIcon.contentTintColor = color(fromHex: defaults.string(forKey: on ? Pref.activeColor : Pref.inactiveColor))
+            ?? (on ? keepAliveGreen : (dark ? .white : .black))
+        centerBarIcon()
         if menuIsOpen { rebuildMenu() }
     }
 
@@ -443,6 +713,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(speakerItem)
 
         menu.addItem(.separator())
+        if let v = updater.available {
+            let update = NSMenuItem(title: "Install WakeWave \(v)", action: #selector(installUpdate), keyEquivalent: "")
+            update.target = self
+            menu.addItem(update)
+        }
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
         let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -476,21 +754,186 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         engine.select(uid: pair?[0], name: pair?[1])
     }
 
+    @objc func installUpdate() { updater.check(manual: true) }
+
+    @objc func openSettings() {
+        if settings == nil { settings = SettingsWindow(app: self) }
+        settings?.show()
+    }
+
     @objc func quitApp() { engine.turnOff(); NSApp.terminate(nil) }
+}
+
+// MARK: - Settings window
+
+final class SettingsWindow: NSWindowController, NSWindowDelegate {
+    private unowned let app: AppDelegate
+    private let activeIcon = NSPopUpButton(), inactiveIcon = NSPopUpButton()
+    private let activeColor = NSColorWell(), inactiveColor = NSColorWell()
+    private let signal = NSPopUpButton()
+    private let login = NSButton(checkboxWithTitle: "Launch WakeWave at login", target: nil, action: nil)
+    private let autoUpdate = NSButton(checkboxWithTitle: "Install updates automatically", target: nil, action: nil)
+    private let checkNow = NSButton(title: "Check Now", target: nil, action: nil)
+    private let updateStatus = NSTextField(wrappingLabelWithString: "")
+
+    init(app: AppDelegate) {
+        self.app = app
+        let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "WakeWave Settings"
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        window.delegate = self
+
+        for popup in [activeIcon, inactiveIcon] {
+            for choice in iconChoices {
+                popup.addItem(withTitle: choice.title)
+                popup.lastItem?.image = NSImage(systemSymbolName: choice.symbol, accessibilityDescription: nil)
+                popup.lastItem?.representedObject = choice.symbol
+            }
+            popup.target = self; popup.action = #selector(iconChanged)
+        }
+        for well in [activeColor, inactiveColor] {
+            well.target = self; well.action = #selector(colorChanged(_:))
+            well.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        }
+        for level in signalLevels {
+            signal.addItem(withTitle: "\(level.title) (\(level.dBFS) dBFS)")
+            signal.lastItem?.tag = level.dBFS
+        }
+        signal.target = self; signal.action = #selector(signalChanged)
+        login.target = self; login.action = #selector(loginChanged)
+        autoUpdate.target = self; autoUpdate.action = #selector(autoUpdateChanged)
+        checkNow.target = self; checkNow.action = #selector(checkForUpdates)
+        updateStatus.preferredMaxLayoutWidth = 230
+        updateStatus.textColor = .secondaryLabelColor
+        let restore = NSButton(title: "Restore Defaults", target: self, action: #selector(restoreDefaults))
+
+        func label(_ text: String) -> NSTextField { NSTextField(labelWithString: text) }
+        func note(_ text: String) -> NSTextField {
+            let f = NSTextField(wrappingLabelWithString: text)
+            f.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            f.textColor = .secondaryLabelColor
+            f.preferredMaxLayoutWidth = 300
+            return f
+        }
+        func row(_ views: [NSView]) -> NSStackView {
+            let s = NSStackView(views: views)
+            s.spacing = 8
+            return s
+        }
+        let empty = NSGridCell.emptyContentView
+        let grid = NSGridView(views: [
+            [label("Icon when on:"), row([activeIcon, activeColor])],
+            [label("Icon when off:"), row([inactiveIcon, inactiveColor])],
+            [empty, restore],
+            [label("Signal strength:"), signal],
+            [empty, note("Raise it if your speaker still turns off.")],
+            [label("Startup:"), login],
+            [label("Updates:"), autoUpdate],
+            [empty, row([checkNow, updateStatus])],
+            [empty, note("Version \(app.updater.version ?? "dev")")],
+        ])
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowAlignment = .firstBaseline
+        grid.rowSpacing = 10
+        grid.columnSpacing = 8
+        for r in [3, 5, 6] { grid.row(at: r).topPadding = 12 }   // gaps between the sections
+        grid.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            grid.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            grid.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+        ])
+        window.contentView = content
+        window.setContentSize(content.fittingSize)
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func show() {
+        sync()
+        NSColorPanel.shared.showsAlpha = false     // solid colors only
+        window?.center()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    // Puts the saved settings and the updater's state into the controls.
+    func sync() {
+        for (popup, key) in [(activeIcon, Pref.activeSymbol), (inactiveIcon, Pref.inactiveSymbol)] {
+            popup.selectItem(at: max(popup.indexOfItem(withRepresentedObject: defaults.string(forKey: key)), 0))
+        }
+        activeColor.color = color(fromHex: defaults.string(forKey: Pref.activeColor)) ?? keepAliveGreen
+        inactiveColor.color = color(fromHex: defaults.string(forKey: Pref.inactiveColor)) ?? .white
+        _ = signal.selectItem(withTag: defaults.integer(forKey: Pref.signalLevel))
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        autoUpdate.state = defaults.bool(forKey: Pref.autoUpdate) ? .on : .off
+        let u = app.updater
+        autoUpdate.isEnabled = u.isEnabled
+        checkNow.isEnabled = u.isEnabled && !u.busy
+        updateStatus.stringValue = u.isEnabled ? (u.status ?? "") : "Updates are off in development builds."
+    }
+
+    @objc private func iconChanged() {
+        defaults.set(activeIcon.selectedItem?.representedObject as? String, forKey: Pref.activeSymbol)
+        defaults.set(inactiveIcon.selectedItem?.representedObject as? String, forKey: Pref.inactiveSymbol)
+        app.refresh()
+    }
+
+    @objc private func colorChanged(_ sender: NSColorWell) {
+        defaults.set(hexString(sender.color), forKey: sender === activeColor ? Pref.activeColor : Pref.inactiveColor)
+        app.refresh()
+    }
+
+    @objc private func restoreDefaults() {
+        for key in [Pref.activeSymbol, Pref.inactiveSymbol, Pref.activeColor, Pref.inactiveColor] {
+            defaults.removeObject(forKey: key)
+        }
+        sync()
+        app.refresh()
+    }
+
+    @objc private func signalChanged() {
+        defaults.set(signal.selectedTag(), forKey: Pref.signalLevel)
+        app.engine.restart()                       // the new level takes effect on the next start
+    }
+
+    @objc private func loginChanged() {
+        do {
+            if login.state == .on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+        if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+        sync()
+    }
+
+    @objc private func autoUpdateChanged() { defaults.set(autoUpdate.state == .on, forKey: Pref.autoUpdate) }
+
+    @objc private func checkForUpdates() { app.updater.check(manual: true) }
+
+    func windowWillClose(_ notification: Notification) { NSColorPanel.shared.close() }
 }
 
 // MARK: - CLI test modes
 
 func selfTest() -> Bool {
     var reasons: [String] = []
-    let exact = Float(pow(10.0, -30.0 / 20.0))
-    if abs(toneAmplitude - exact) > 1e-7 { reasons.append("toneAmplitude \(toneAmplitude) != \(exact)") }
+    for level in signalLevels {
+        let exact = Float(pow(10.0, Double(level.dBFS) / 20.0))
+        if abs(level.amplitude - exact) > 1e-6 { reasons.append("\(level.title) amplitude \(level.amplitude) != \(exact)") }
+    }
+    let amplitude = signalLevels[0].amplitude
     var report = ""
     for rate in [48000.0, 44100.0] {
         let channels = 2, total = Int(rate)            // one second
         var chunked = [Float](repeating: 0, count: total * channels)
         var single = chunked
-        var g1 = ToneGenerator(sampleRate: rate), g2 = ToneGenerator(sampleRate: rate)
+        var g1 = ToneGenerator(sampleRate: rate, amplitude: amplitude)
+        var g2 = ToneGenerator(sampleRate: rate, amplitude: amplitude)
         chunked.withUnsafeMutableBufferPointer { buf in
             var done = 0
             while done < total {                       // odd chunk size exercises the table wrap
@@ -506,11 +949,27 @@ func selfTest() -> Bool {
         let crossings = zip(left, left.dropFirst()).filter { ($0 < 0) != ($1 < 0) }.count
         if chunked != single { reasons.append("\(Int(rate)): chunked != single") }
         if !channelsEqual { reasons.append("\(Int(rate)): channels differ") }
-        if abs(peak - toneAmplitude) > toneAmplitude * 0.01 { reasons.append("\(Int(rate)): peak \(peak)") }
+        if abs(peak - amplitude) > amplitude * 0.01 { reasons.append("\(Int(rate)): peak \(peak)") }
         if abs(crossings - 40) > 1 { reasons.append("\(Int(rate)): crossings \(crossings)") }
         report += " \(Int(rate)):table=\(g1.table.count),peak=\(peak),crossings=\(crossings)"
     }
-    print(reasons.isEmpty ? "SELFTEST OK" + report : "SELFTEST FAIL " + reasons.joined(separator: "; "))
+    // Update math: version order and signature checks (a throwaway key; no network).
+    for (a, b, newer) in [("1.0.1", "1.0.0", true), ("1.10.0", "1.9.9", true), ("2", "1.9", true),
+                          ("1.0", "1.0.0", false), ("1.0.0", "1.0.1", false), ("1.0.0", "1.0.0", false)]
+        where isNewer(a, than: b) != newer { reasons.append("isNewer(\(a), \(b)) != \(newer)") }
+    let key = Curve25519.Signing.PrivateKey(), file = Data("WakeWave".utf8)
+    let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+    if let sig = try? key.signature(for: file) {
+        if !signatureIsValid(sig, for: file, publicKeys: [publicKey]) { reasons.append("valid signature rejected") }
+        if !signatureIsValid(sig, for: file, publicKeys: updatePublicKeys + [publicKey]) { reasons.append("second listed key rejected") }
+        if signatureIsValid(sig, for: Data("WakeWav3".utf8), publicKeys: [publicKey]) { reasons.append("tampered file accepted") }
+        if signatureIsValid(sig, for: file) { reasons.append("signature from an unlisted key accepted") }
+    } else { reasons.append("could not sign") }
+    if updatePublicKeys.isEmpty { reasons.append("no update keys") }
+    for k in updatePublicKeys where (try? Curve25519.Signing.PublicKey(rawRepresentation: Data(base64Encoded: k) ?? Data())) == nil {
+        reasons.append("updatePublicKeys entry \(k) is not a valid Ed25519 key")
+    }
+    print(reasons.isEmpty ? "SELFTEST OK" + report + " updates:ok" : "SELFTEST FAIL " + reasons.joined(separator: "; "))
     return reasons.isEmpty
 }
 
@@ -536,6 +995,8 @@ if args.count > 1 {
         print("device=\(name) callbacks=\(r?.callbacks ?? 0) frames=\(r?.frames ?? 0) rate=\(rate) buffer=\(r?.lastBufferFrames ?? 0)")
         if let e = engine.lastError { print("error=\(e)") }
         exit((r?.callbacks ?? 0) > 0 ? 0 : 1)
+    case "--resume":                        // relaunched by an update; handled by AppDelegate
+        break
     default:
         FileHandle.standardError.write("usage: WakeWave [--selftest | --list | --probe SECONDS]\n".data(using: .utf8)!)
         exit(2)

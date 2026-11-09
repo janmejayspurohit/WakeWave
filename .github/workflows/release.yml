@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal app
+        run: VERSION="${GITHUB_REF_NAME#v}" ARCHS="arm64 x86_64" APP_DEST=dist ./build.sh
+
+      - name: Test
+        run: |
+          dist/WakeWave.app/Contents/MacOS/WakeWave --selftest
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 dist/WakeWave.app/Contents/MacOS/WakeWave --selftest; fi
+
+      - name: Package DMG
+        run: scripts/make-dmg.sh dist/WakeWave.app WakeWave.dmg
+
+      - name: Sign update
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: swift scripts/sign-update.swift WakeWave.dmg > WakeWave.dmg.sig
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" WakeWave.dmg WakeWave.dmg.sig --title "WakeWave ${GITHUB_REF_NAME#v}" --generate-notes
