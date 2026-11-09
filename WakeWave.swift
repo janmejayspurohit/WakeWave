@@ -388,15 +388,20 @@ func runTool(_ path: String, _ arguments: String...) throws {
 func stageUpdate(dmg: URL, version: String, bundleID: String) throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("WakeWave-update-\(UUID().uuidString)")
     let mount = dir.appendingPathComponent("mount"), app = dir.appendingPathComponent("WakeWave.app")
-    try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
-    try runTool("/usr/bin/hdiutil", "attach", "-nobrowse", "-noautoopen", "-readonly", "-mountpoint", mount.path, dmg.path)
-    defer { try? runTool("/usr/bin/hdiutil", "detach", "-force", mount.path) }
-    try runTool("/usr/bin/ditto", mount.appendingPathComponent("WakeWave.app").path, app.path)
-    guard let b = Bundle(url: app), b.bundleIdentifier == bundleID,
-          b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == version else {
-        throw UpdateError("the downloaded app is not WakeWave \(version)")
+    do {
+        try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
+        try runTool("/usr/bin/hdiutil", "attach", "-nobrowse", "-noautoopen", "-readonly", "-mountpoint", mount.path, dmg.path)
+        defer { try? runTool("/usr/bin/hdiutil", "detach", "-force", mount.path) }
+        try runTool("/usr/bin/ditto", mount.appendingPathComponent("WakeWave.app").path, app.path)
+        guard let b = Bundle(url: app), b.bundleIdentifier == bundleID,
+              b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == version else {
+            throw UpdateError("the downloaded app is not WakeWave \(version)")
+        }
+        return app
+    } catch {
+        try? FileManager.default.removeItem(at: dir)  // leave nothing behind in the temp folder
+        throw error
     }
-    return app
 }
 
 enum UpdateState: Equatable {
@@ -484,6 +489,7 @@ final class Updater {
 
     private func replaceAndRelaunch(with app: URL, dmg: URL, version: String) {
         let target = Bundle.main.bundleURL
+        defer { try? FileManager.default.removeItem(at: app.deletingLastPathComponent()) }   // the staging folder
         do {
             _ = try FileManager.default.replaceItemAt(target, withItemAt: app)
         } catch {
@@ -853,7 +859,6 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
 
     func show() {
         sync()
-        NSColorPanel.shared.showsAlpha = false     // solid colors only
         window?.center()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -926,7 +931,11 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
 
     @objc private func checkForUpdates() { app.updater.check(manual: true) }
 
-    func windowWillClose(_ notification: Notification) { NSColorPanel.shared.close() }
+    // Touching NSColorPanel.shared loads the system color picker (~16 MB that is never given back),
+    // so only close it if a color well already opened it. Colors are saved as #RRGGBB, so alpha is ignored.
+    func windowWillClose(_ notification: Notification) {
+        if NSColorPanel.sharedColorPanelExists { NSColorPanel.shared.close() }
+    }
 }
 
 // MARK: - CLI test modes
